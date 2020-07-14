@@ -2,27 +2,77 @@ import os
 import cv2
 import numpy as np
 import torch
-from torchvision import transforms as tv_transforms
-from .models import init_model
-from collections import OrderedDict
 
 working_root = os.path.split(os.path.realpath(__file__))[0]
 
 
-class FeatureExtract(object):
-    def __init__(self, checkpoint_file_path=None, model=None, feature_size=2048):
-        super(FeatureExtract, self).__init__()
-        self.checkpoint_file_path = checkpoint_file_path
-        self.transforms = None
-        self.model = model
-        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+class TorchInference(object):
+    def __init__(self, model_path=None, device=None):
+        """
+        对TorchInference进行初始化
+
+        Parameters
+        ----------
+        model_path : str
+            pytorch模型的路径，推荐使用绝对路径
+        """
+        super().__init__()
+        self.model_path = model_path
+        self.device = device
+        if self.model_path is None:
+            print("please set pytorch model path!\n")
+            exit(-1)
+        self.session = None
+        self.model_loader()
+
+    def model_loader(self):
+        if torch.__version__ < "1.0.0":
+            print("Pytorch version is not  1.0.0, please check it!")
+            exit(-1)
+        if self.model_path is None:
+            print("Please set model path!!")
+            exit(-1)
+        if self.device is None:
+            self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        # check_point = torch.load(self.checkpoint_file_path, map_location=self.device)
+        # self.model = check_point['net'].to(self.device)
+        self.session = torch.jit.load(self.model_path, map_location=self.device)
+        # 如果模型为pytorch0.3.1版本，需要以下代码添加BN内的参数
+        # for _, module in self.model._modules.items():
+        #     recursion_change_bn(self.model)
+        self.session.eval()
+
+    def inference(self, x: torch.Tensor):
+        """
+        pytorch的推理
+        Parameters
+        ----------
+        x : torch.Tensor
+            pytorch模型输入
+
+        Returns
+        -------
+        torch.Tensor
+            pytorch模型推理结果
+        """
+        x = x.to(self.device)
+        self.session = self.session.to(self.device)
+        outputs = self.session(x)
+        return outputs
+
+
+class FeatureExtract(TorchInference):
+    def __init__(self, model_path=None, device=None):
+        super(FeatureExtract, self).__init__(model_path, device)
         self.config = {
-            "feature_size": feature_size,
             "width": 112,
             "height": 112,
+            'color_format': 'RGB',
+            'mean': [0.4914, 0.4822, 0.4465],
+            'stddev': [0.247, 0.243, 0.261],
+            'divisor': 255.0,
             "batch_size": 32,
-            "mean": [0.4914, 0.4822, 0.4465],
-            "stddev": [0.247, 0.243, 0.261],
+            "feature_size": 512,
             "pic_nums": 12,
             "pick_type": 0,
         }
@@ -30,24 +80,35 @@ class FeatureExtract(object):
         #     tv_transforms.ToTensor(),
         #     tv_transforms.Normalize(self.config['mean'], self.config['stddev'])
         # ])
-        self.model_loader()
-
-    def model_loader(self):
-        if self.checkpoint_file_path is None:
-            self.checkpoint_file_path = os.path.join(working_root,
-                                                    "models/resnet50_51_0.4229_jit.pth")
-
-        if self.device is None:
-            self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.model = torch.jit.load(self.checkpoint_file_path, map_location=self.device)
-        self.model = self.model.cuda() if self.device == "cuda:0" else self.model
-        self.model.eval()
 
     def set_config(self, key: str, value):
         if key not in self.config.keys():
             print("key not in config list! please check it!")
             exit(-1)
         self.config[key] = value
+
+    def _pre_process(self, image: np.ndarray) -> torch.Tensor:
+        """对图像进行预处理
+
+        Parameters
+        ----------
+        image : np.ndarray
+            输入的原始图像，BGR格式，通常使用cv2.imread读取得到
+
+        Returns
+        -------
+        np.ndarray
+            原始图像经过预处理后得到的数组
+        """
+        if self.config['color_format'] == "RGB":
+            image = image[:, :, ::-1]
+        if self.config['width'] > 0 and self.config['height'] > 0:
+            image = cv2.resize(image, (self.config['width'], self.config['height']))
+        input_image = (np.array(image, dtype=np.float32) / self.config['divisor'] - self.config['mean']) / self.config['stddev']
+        input_image = input_image.transpose(2, 0, 1)
+        input_image = np.expand_dims(input_image, 0)
+        input_image = torch.from_numpy(input_image).float()
+        return input_image
 
     def enlarged_box(self, box):
         x1, y1, x2, y2 = box
@@ -71,7 +132,7 @@ class FeatureExtract(object):
         if self.config['pick_type']:
             if self.config['pic_nums'] >= 1:
                 indeces = [int(i * max(1.0, ((len(track_frames) - 1) / self.config['pic_nums'])))
-                           for i in range(1, min(self.config['pic_nums'] + 1, len(track_frames)))]
+                           for i in range(1, min(self.config['pic_nums'], len(track_frames)))]
             else:
                 indeces = range(len(track_frames))
         else:
@@ -85,12 +146,7 @@ class FeatureExtract(object):
         return [track_frames[index] for index in indeces]
 
     def feature_extract(self, input_image):
-        input_image = cv2.resize(input_image, dsize=(self.config['width'], self.config['height']))
-        input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
-        # input_image = self.transforms(input_image)
-        input_image = (np.array(input_image, dtype=np.float32) / 255 - self.config['mean']) / self.config['stddev']
-        input_image = torch.from_numpy(input_image.transpose([2, 0, 1])).float()
-        input_image = torch.unsqueeze(input_image, dim=0)
+        input_image = self._pre_process(input_image)
         input_image = input_image.cuda() if self.device == "cuda:0" else input_image
         features = self.model(input_image)
         features = torch.squeeze(features)
@@ -144,12 +200,10 @@ class FeatureExtract(object):
             image = track_frame['image']
             box = self.enlarged_box(box)
             image = self.cut_box_with_image(image, box)
-            if passenger['up_or_down'] == 1:
-                image = cv2.flip(image, 0)
-            image = cv2.resize(image, (144, 144))
+            image = cv2.resize(image, (self.config['width'], self.config['height']))
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             passenger_pic_list[index] = image
-        passenger_pic_list = (np.array(passenger_pic_list, dtype=np.float32) / 255
+        passenger_pic_list = (np.array(passenger_pic_list, dtype=np.float32) / self.config['divisor']
                               - self.config['mean']) / self.config['stddev']
         person_batch = len(passenger_pic_list) // self.config['batch_size']
         person_id_features = np.zeros([0, self.config['feature_size']], np.float)
@@ -196,10 +250,10 @@ class FeatureExtract(object):
             box = track_frame['frame_rectangle']
             image = track_frame['frame']
             image = image[int(box[1]):int(box[3]), int(box[0]):int(box[2]), :]
-            image = cv2.resize(image, (144, 144))
+            image = cv2.resize(image, (self.config['width'], self.config['height']))
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             passenger_pic_list.append(image)
-        passenger_pic_list = (np.array(passenger_pic_list, dtype=np.float32) / 255
+        passenger_pic_list = (np.array(passenger_pic_list, dtype=np.float32) / self.config['divisor']
                               - self.config['mean']) / self.config['stddev']
         person_batch = len(passenger_pic_list) // self.config['batch_size']
         person_id_features = np.zeros([0, self.config['feature_size']], np.float)
